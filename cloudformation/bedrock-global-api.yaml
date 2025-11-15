@@ -1,0 +1,1390 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Production-ready global API architecture for Amazon Bedrock with multi-region support, caching, authentication, and observability'
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Custom domain name for the API (e.g., api.example.com)
+    AllowedPattern: '^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?)*$'
+  
+  PrimaryRegion:
+    Type: String
+    Description: Primary AWS region for deployment
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-southeast-1
+  
+  SecondaryRegions:
+    Type: CommaDelimitedList
+    Description: Secondary regions for multi-region failover (comma-separated, e.g., us-west-2,eu-west-1)
+    Default: us-west-2,eu-west-1
+  
+  Environment:
+    Type: String
+    Description: Environment name
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+  
+  Applications:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of application names (e.g., app1,app2,app3)
+    Default: webapp1,webapp2
+  
+  BedrockAgents:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of Bedrock agent IDs (e.g., agent1,agent2)
+    Default: ''
+  
+  KnowledgeBases:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of Bedrock knowledge base IDs (e.g., kb1,kb2)
+    Default: ''
+  
+  CacheTTL:
+    Type: Number
+    Description: DynamoDB cache TTL in seconds
+    Default: 3600
+    MinValue: 60
+    MaxValue: 86400
+  
+  EnableDAX:
+    Type: String
+    Description: Enable DynamoDB Accelerator (DAX) cluster
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  EnableCloudFront:
+    Type: String
+    Description: Enable CloudFront distribution
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  DAXNodeType:
+    Type: String
+    Description: DAX node instance type
+    Default: dax.t3.small
+    AllowedValues:
+      - dax.t3.small
+      - dax.t3.medium
+      - dax.r4.large
+      - dax.r4.xlarge
+      - dax.r4.2xlarge
+  
+  DAXClusterSize:
+    Type: Number
+    Description: Number of DAX nodes in cluster
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+  
+  WAFAllowedIPs:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of allowed IP addresses for testing (CIDR format)
+    Default: ''
+  
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN (leave empty to auto-create)
+    Default: ''
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      BedrockRegion: us-east-1
+      AvailabilityZones: us-east-1a,us-east-1b,us-east-1c
+    us-west-2:
+      BedrockRegion: us-west-2
+      AvailabilityZones: us-west-2a,us-west-2b,us-west-2c
+    eu-west-1:
+      BedrockRegion: eu-west-1
+      AvailabilityZones: eu-west-1a,eu-west-1b,eu-west-1c
+    ap-southeast-1:
+      BedrockRegion: ap-southeast-1
+      AvailabilityZones: ap-southeast-1a,ap-southeast-1b,ap-southeast-1c
+
+Conditions:
+  CreateCertificate: !Equals [!Ref CertificateArn, '']
+  EnableDAXCondition: !Equals [!Ref EnableDAX, 'true']
+  EnableCloudFrontCondition: !Equals [!Ref EnableCloudFront, 'true']
+  HasWAFIPs: !Not [!Equals [!Join ['', !Ref WAFAllowedIPs], '']]
+  HasBedrockAgents: !Not [!Equals [!Join ['', !Ref BedrockAgents], '']]
+
+Resources:
+  # ============================================
+  # ACM Certificate
+  # ============================================
+  ApiCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: CreateCertificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZone
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Name
+          Value: !Sub '${DomainName}-certificate'
+
+  # ============================================
+  # Route 53 Hosted Zone
+  # ============================================
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub 'Hosted zone for ${DomainName}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # Cognito User Pool
+  # ============================================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${Environment}-bedrock-api-users'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Cognito User Pool Client (default client for all applications)
+  # Note: You can create additional clients manually or via stack updates
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: !Sub '${Environment}-bedrock-api-client'
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 1440
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+
+  # ============================================
+  # KMS Keys
+  # ============================================
+  SQSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for SQS encryption - ${Environment}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow SQS
+            Effect: Allow
+            Principal:
+              Service: sqs.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  SQSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${Environment}-sqs-key'
+      TargetKeyId: !Ref SQSKey
+
+  DynamoDBKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for DynamoDB encryption - ${Environment}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow DynamoDB
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DynamoDBKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${Environment}-dynamodb-key'
+      TargetKeyId: !Ref DynamoDBKey
+
+  # ============================================
+  # SQS Queues
+  # ============================================
+  RequestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-bedrock-api-requests'
+      VisibilityTimeoutSeconds: 300
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      KmsMasterKeyId: !Ref SQSKey
+      KmsDataKeyReusePeriodSeconds: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-bedrock-api-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref SQSKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # DynamoDB Table
+  # ============================================
+  ResponseCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-bedrock-response-cache'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: RequestHash
+          AttributeType: S
+        - AttributeName: TTL
+          AttributeType: N
+      KeySchema:
+        - AttributeName: RequestHash
+          KeyType: HASH
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: TTL
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDBKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Name
+          Value: !Sub '${Environment}-bedrock-response-cache'
+
+  # ============================================
+  # DAX Cluster
+  # ============================================
+  DAXSubnetGroup:
+    Type: AWS::DAX::SubnetGroup
+    Condition: EnableDAXCondition
+    Properties:
+      SubnetGroupName: !Sub '${Environment}-dax-subnet-group'
+      Description: Subnet group for DAX cluster
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  DAXParameterGroup:
+    Type: AWS::DAX::ParameterGroup
+    Condition: EnableDAXCondition
+    Properties:
+      ParameterGroupName: !Sub '${Environment}-dax-params'
+      Description: Parameter group for DAX cluster
+
+  DAXCluster:
+    Type: AWS::DAX::Cluster
+    Condition: EnableDAXCondition
+    Properties:
+      ClusterName: !Sub '${Environment}-bedrock-cache-dax'
+      Description: DAX cluster for Bedrock response cache
+      IAMRoleARN: !GetAtt DAXServiceRole.Arn
+      NodeType: !Ref DAXNodeType
+      ReplicationFactor: !Ref DAXClusterSize
+      SubnetGroupName: !Ref DAXSubnetGroup
+      ParameterGroupName: !Ref DAXParameterGroup
+      SecurityGroupIds:
+        - !Ref DAXSecurityGroup
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DAXSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: EnableDAXCondition
+    Properties:
+      GroupName: !Sub '${Environment}-dax-sg'
+      GroupDescription: Security group for DAX cluster
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8111
+          ToPort: 8111
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # VPC Resources (for DAX and VPC endpoints)
+  # ============================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Condition: EnableDAXCondition
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-bedrock-vpc'
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: EnableDAXCondition
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !Split [',', !FindInMap [RegionMap, !Ref 'AWS::Region', AvailabilityZones]]]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-public-subnet-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: EnableDAXCondition
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !Split [',', !FindInMap [RegionMap, !Ref 'AWS::Region', AvailabilityZones]]]
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-public-subnet-2'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: EnableDAXCondition
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: EnableDAXCondition
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: EnableDAXCondition
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-public-rt'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    Condition: EnableDAXCondition
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: EnableDAXCondition
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: EnableDAXCondition
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: EnableDAXCondition
+    Properties:
+      GroupName: !Sub '${Environment}-lambda-sg'
+      GroupDescription: Security group for Lambda function
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS services
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP outbound for AWS services
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # IAM Roles
+  # ============================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-bedrock-routing-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-runtime:InvokeModel
+                  - bedrock-runtime:InvokeModelWithResponseStream
+                  - bedrock-agent-runtime:InvokeAgent
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::agent/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt ResponseCacheTable.Arn
+                  - !Sub '${ResponseCacheTable.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt RequestQueue.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - !Ref DynamoDBKey
+                  - !Ref SQSKey
+        - !If
+          - EnableDAXCondition
+          - PolicyName: DAXAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+              - Effect: Allow
+                Action:
+                  - dax:GetItem
+                  - dax:PutItem
+                  - dax:Query
+                  - dax:Scan
+                  - dax:BatchGetItem
+                  - dax:BatchWriteItem
+                Resource: 
+                  - !GetAtt DAXCluster.ClusterArn
+                  - !Sub '${DAXCluster.ClusterArn}/*'
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DAXServiceRole:
+    Type: AWS::IAM::Role
+    Condition: EnableDAXCondition
+    Properties:
+      RoleName: !Sub '${Environment}-dax-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dax.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DAXDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt ResponseCacheTable.Arn
+                  - !Sub '${ResponseCacheTable.Arn}/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Default Application IAM Role
+  # Note: Create additional roles per application via stack updates or manually
+  # The Lambda function handles routing based on app_name header
+  DefaultApplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-bedrock-api-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-runtime:InvokeModel
+                  - bedrock-runtime:InvokeModelWithResponseStream
+                  - bedrock-agent-runtime:InvokeAgent
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::agent/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # Lambda Function
+  # ============================================
+  # WARNING: The inline Lambda code below is OUTDATED and does not match
+  # the improved version in lambda-routing-function/index.py
+  # 
+  # The inline code is missing:
+  # - Input validation (validate_input function)
+  # - Proper error handling with error IDs
+  # - Batch size limits
+  # - Null checks for AWS clients
+  # - Improved Bedrock response handling
+  #
+  # RECOMMENDED: Package lambda-routing-function/index.py with dependencies,
+  # upload to S3, and reference S3 location instead of using inline code.
+  # See CODE_QUALITY_REVIEW.md for details.
+  RoutingLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-bedrock-api-routing'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import hashlib
+          import time
+          from datetime import datetime, timedelta
+          
+          # Initialize clients outside handler for performance
+          bedrock_runtime = boto3.client('bedrock-runtime', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+          dynamodb = boto3.resource('dynamodb')
+          dax_client = None
+          
+          # Initialize DAX if endpoint is provided
+          dax_endpoint = os.environ.get('DAX_ENDPOINT')
+          if dax_endpoint:
+              from amazondax import AmazonDaxClient
+              dax_client = AmazonDaxClient(endpoints=[dax_endpoint], region_name=os.environ.get('AWS_REGION'))
+          
+          table_name = os.environ.get('CACHE_TABLE_NAME')
+          cache_table = dynamodb.Table(table_name) if table_name else None
+          
+          # Routing configuration (can be loaded from S3 or environment)
+          ROUTING_CONFIG = {
+              'agents': os.environ.get('BEDROCK_AGENTS', '').split(','),
+              'knowledge_bases': os.environ.get('KNOWLEDGE_BASES', '').split(','),
+              'default_agent': os.environ.get('DEFAULT_AGENT', ''),
+              'routing_rules': {
+                  'app1': {'agent': 'agent1', 'knowledge_base': 'kb1'},
+                  'app2': {'agent': 'agent2', 'knowledge_base': 'kb2'},
+              }
+          }
+          
+          def get_cache_key(request_body, app_name):
+              """Generate cache key from request"""
+              key_string = f"{app_name}:{json.dumps(request_body, sort_keys=True)}"
+              return hashlib.sha256(key_string.encode()).hexdigest()
+          
+          def get_from_cache(cache_key):
+              """Retrieve from cache (DAX or DynamoDB)"""
+              if not cache_table:
+                  return None
+              
+              try:
+                  if dax_client:
+                      response = dax_client.get_item(
+                          TableName=table_name,
+                          Key={'RequestHash': {'S': cache_key}}
+                      )
+                      if 'Item' in response:
+                          return json.loads(response['Item']['Response']['S'])
+                  else:
+                      response = cache_table.get_item(Key={'RequestHash': cache_key})
+                      if 'Item' in response:
+                          return json.loads(response['Item']['Response'])
+              except Exception as e:
+                  print(f"Cache read error: {str(e)}")
+              return None
+          
+          def put_to_cache(cache_key, response_data, ttl_seconds=3600):
+              """Store response in cache"""
+              if not cache_table:
+                  return
+              
+              try:
+                  ttl = int(time.time()) + ttl_seconds
+                  item = {
+                      'RequestHash': cache_key,
+                      'Response': json.dumps(response_data),
+                      'TTL': ttl
+                  }
+                  
+                  if dax_client:
+                      dax_client.put_item(
+                          TableName=table_name,
+                          Item={
+                              'RequestHash': {'S': cache_key},
+                              'Response': {'S': json.dumps(response_data)},
+                              'TTL': {'N': str(ttl)}
+                          }
+                      )
+                  else:
+                      cache_table.put_item(Item=item)
+              except Exception as e:
+                  print(f"Cache write error: {str(e)}")
+          
+          def route_request(app_name, request_body):
+              """Determine routing based on app and request"""
+              rules = ROUTING_CONFIG.get('routing_rules', {})
+              app_config = rules.get(app_name, {})
+              
+              agent_id = app_config.get('agent') or ROUTING_CONFIG.get('default_agent')
+              kb_id = app_config.get('knowledge_base')
+              
+              return {
+                  'agent_id': agent_id,
+                  'knowledge_base_id': kb_id
+              }
+          
+          def invoke_bedrock_agent(agent_id, session_id, input_text):
+              """Invoke Bedrock agent"""
+              try:
+                  response = bedrock_runtime.invoke_agent(
+                      agentId=agent_id,
+                      sessionId=session_id,
+                      inputText=input_text
+                  )
+                  
+                  result = ''
+                  for event in response['completion']:
+                      if 'chunk' in event:
+                          result += event['chunk']['bytes'].decode('utf-8')
+                  
+                  return {'statusCode': 200, 'body': result}
+              except Exception as e:
+                  print(f"Bedrock invocation error: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+          
+          def handler(event, context):
+              """Main Lambda handler"""
+              try:
+                  # Parse SQS event
+                  records = event.get('Records', [])
+                  if not records:
+                      return {'statusCode': 400, 'body': 'No records found'}
+                  
+                  results = []
+                  for record in records:
+                      body = json.loads(record['body'])
+                      app_name = body.get('app_name')
+                      request_data = body.get('request')
+                      
+                      # Check cache
+                      cache_key = get_cache_key(request_data, app_name)
+                      cached_response = get_from_cache(cache_key)
+                      
+                      if cached_response:
+                          results.append({
+                              'statusCode': 200,
+                              'body': cached_response,
+                              'cached': True
+                          })
+                          continue
+                      
+                      # Route request
+                      routing = route_request(app_name, request_data)
+                      agent_id = routing.get('agent_id')
+                      
+                      if not agent_id:
+                          results.append({
+                              'statusCode': 400,
+                              'body': json.dumps({'error': 'No agent configured for app'})
+                          })
+                          continue
+                      
+                      # Invoke Bedrock
+                      session_id = body.get('session_id', f"session-{int(time.time())}")
+                      input_text = request_data.get('input', request_data.get('query', ''))
+                      
+                      response = invoke_bedrock_agent(agent_id, session_id, input_text)
+                      
+                      # Cache successful responses
+                      if response['statusCode'] == 200:
+                          put_to_cache(cache_key, response['body'], ttl_seconds=int(os.environ.get('CACHE_TTL', 3600)))
+                      
+                      results.append(response)
+                  
+                  return {'statusCode': 200, 'results': results}
+              except Exception as e:
+                  print(f"Handler error: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrentExecutions: 100
+      EphemeralStorage:
+        Size: 512
+      Environment:
+        Variables:
+          CACHE_TABLE_NAME: !Ref ResponseCacheTable
+          CACHE_TTL: !Ref CacheTTL
+          BEDROCK_AGENTS: !Join [',', !Ref BedrockAgents]
+          KNOWLEDGE_BASES: !Join [',', !Ref KnowledgeBases]
+          DEFAULT_AGENT: !If [HasBedrockAgents, !Select [0, !Ref BedrockAgents], '']
+          DAX_ENDPOINT: !If [EnableDAXCondition, !GetAtt DAXCluster.ClusterDiscoveryEndpoint, '']
+          LOG_LEVEL: !If 
+            - !Equals [!Ref Environment, 'prod']
+            - 'INFO'
+            - 'DEBUG'
+      TracingConfig:
+        Mode: Active
+      VpcConfig: !If
+        - EnableDAXCondition
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+        - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SQS Event Source Mapping
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RequestQueue.Arn
+      FunctionName: !Ref RoutingLambdaFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # ============================================
+  # API Gateway HTTP API
+  # ============================================
+  ApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${Environment}-bedrock-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub 'https://${DomainName}'
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - x-app-name
+        MaxAge: 3600
+        AllowCredentials: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # JWT Authorizer
+  JWTAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref ApiGateway
+      AuthorizerType: JWT
+      IdentitySource:
+        - $request.header.Authorization
+      JwtConfiguration:
+        Audience:
+          - !GetAtt CognitoUserPoolClient.ClientId
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}'
+
+  # API Gateway Integration
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationSubtype: SQS
+      IntegrationMethod: POST
+      PayloadFormatVersion: '1.0'
+      CredentialsArn: !GetAtt ApiGatewayRole.Arn
+      RequestParameters:
+        QueueUrl: !GetAtt RequestQueue.Url
+        MessageBody: $request.body
+        MessageAttributes: |
+          {
+            "app_name": {
+              "DataType": "String",
+              "StringValue": "$request.header.x-app-name"
+            },
+            "source_ip": {
+              "DataType": "String",
+              "StringValue": "$context.identity.sourceIp"
+            }
+          }
+
+  # API Gateway Route
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'POST /api/v1/chat'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizerId: !Ref JWTAuthorizer
+
+  # API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ApiGateway
+      StageName: !Ref Environment
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 1000
+        ThrottlingRateLimit: 500
+        DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: |
+          {
+            "requestId": "$context.requestId",
+            "ip": "$context.identity.sourceIp",
+            "requestTime": "$context.requestTime",
+            "httpMethod": "$context.httpMethod",
+            "routeKey": "$context.routeKey",
+            "status": "$context.status",
+            "protocol": "$context.protocol",
+            "responseLength": "$context.responseLength"
+          }
+
+  # API Gateway Custom Domain
+  ApiDomainName:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - CertificateArn: !If [CreateCertificate, !Ref ApiCertificate, !Ref CertificateArn]
+          EndpointType: REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiDomainMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Properties:
+      ApiId: !Ref ApiGateway
+      DomainName: !Ref ApiDomainName
+      Stage: !Ref ApiStage
+
+  # API Gateway Role
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-api-gateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt RequestQueue.Arn
+                Condition:
+                  StringEquals:
+                    'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # ============================================
+  # CloudFront Distribution
+  # ============================================
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: EnableCloudFrontCondition
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Ref DomainName
+        DefaultRootObject: ''
+        Origins:
+          - Id: ApiGatewayOrigin
+            DomainName: !GetAtt ApiDomainName.RegionalDomainName
+            CustomOriginConfig:
+              HTTPPort: 443
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: ApiGatewayOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c79-47e2-bb9a-3d71be816a07
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9f9f
+        Enabled: true
+        PriceClass: PriceClass_All
+        ViewerCertificate:
+          AcmCertificateArn: !If [CreateCertificate, !Ref ApiCertificate, !Ref CertificateArn]
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Comment: !Sub 'CloudFront distribution for ${DomainName}'
+        Logging:
+          Bucket: !GetAtt CloudFrontLogBucket.DomainName
+          Prefix: access-logs/
+          IncludeCookies: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  CloudFrontLogBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableCloudFrontCondition
+    Properties:
+      BucketName: !Sub '${Environment}-${AWS::AccountId}-cloudfront-logs'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # WAF
+  # ============================================
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${Environment}-bedrock-api-waf'
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSetMetric
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputsMetric
+        - Name: AWSManagedRulesLinuxRuleSet
+          Priority: 3
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesLinuxRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: LinuxRuleSetMetric
+        - Name: RateLimitRule
+          Priority: 4
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitMetric
+        - Name: IPWhitelistRule
+          Priority: 0
+          Condition: HasWAFIPs
+          Statement:
+            IPSetReferenceStatement:
+              IPSetArn: !GetAtt WAFIPSet.Arn
+          Action:
+            Allow: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: IPWhitelistMetric
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${Environment}-WAF-Metrics'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  WAFIPSet:
+    Type: AWS::WAFv2::IPSet
+    Condition: HasWAFIPs
+    Properties:
+      Name: !Sub '${Environment}-waf-allowed-ips'
+      Scope: CLOUDFRONT
+      IPAddressVersion: IPV4
+      Addresses: !Ref WAFAllowedIPs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  WAFAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: EnableCloudFrontCondition
+    Properties:
+      ResourceArn: !GetAtt CloudFrontDistribution.Arn
+      WebACLArn: !GetAtt WAFWebACL.Arn
+
+  # ============================================
+  # CloudWatch Logs
+  # ============================================
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${Environment}-bedrock-api'
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${RoutingLambdaFunction}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # CloudWatch Alarms
+  # ============================================
+  SQSDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-sqs-queue-depth'
+      AlarmDescription: Alert when SQS queue depth exceeds threshold
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt RequestQueue.QueueName
+      AlarmActions:
+        - !Ref CloudWatchAlarmTopic
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-lambda-errors'
+      AlarmDescription: Alert when Lambda error rate is high
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RoutingLambdaFunction
+      AlarmActions:
+        - !Ref CloudWatchAlarmTopic
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-lambda-duration'
+      AlarmDescription: Alert when Lambda duration exceeds threshold
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 250000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RoutingLambdaFunction
+      AlarmActions:
+        - !Ref CloudWatchAlarmTopic
+
+  ApiGateway4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-api-4xx-errors'
+      AlarmDescription: Alert when API 4xx error rate is high
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ApiGateway
+      AlarmActions:
+        - !Ref CloudWatchAlarmTopic
+
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-api-5xx-errors'
+      AlarmDescription: Alert when API 5xx error rate is high
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ApiGateway
+      AlarmActions:
+        - !Ref CloudWatchAlarmTopic
+
+  CloudWatchAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Environment}-bedrock-api-alarms'
+      DisplayName: Bedrock API Alarms
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # Route 53 Records
+  # ============================================
+  ApiDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !If [EnableCloudFrontCondition, !GetAtt CloudFrontDistribution.DomainName, !GetAtt ApiDomainName.RegionalDomainName]
+        HostedZoneId: !If [EnableCloudFrontCondition, Z2FDTNDATAQYW2, !GetAtt ApiDomainName.RegionalHostedZoneId]
+        EvaluateTargetHealth: false
+
+Outputs:
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayUrl'
+
+  CloudFrontUrl:
+    Description: CloudFront distribution URL
+    Condition: EnableCloudFrontCondition
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontUrl'
+
+  ApiDomainName:
+    Description: Custom API domain name
+    Value: !Ref DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiDomainName'
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoUserPoolId'
+
+  CognitoUserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !GetAtt CognitoUserPoolClient.ClientId
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoUserPoolClientId'
+
+  DynamoDBTableName:
+    Description: DynamoDB cache table name
+    Value: !Ref ResponseCacheTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DAXClusterEndpoint:
+    Description: DAX cluster endpoint
+    Condition: EnableDAXCondition
+    Value: !GetAtt DAXCluster.ClusterDiscoveryEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-DAXClusterEndpoint'
+
+  Route53HostedZoneId:
+    Description: Route 53 Hosted Zone ID
+    Value: !Ref HostedZone
+    Export:
+      Name: !Sub '${AWS::StackName}-Route53HostedZoneId'
+
+  WAFWebACLArn:
+    Description: WAF Web ACL ARN
+    Value: !GetAtt WAFWebACL.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WAFWebACLArn'
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt RoutingLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  SQSQueueUrl:
+    Description: SQS request queue URL
+    Value: !Ref RequestQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-SQSQueueUrl'
+
+  CertificateArn:
+    Description: ACM certificate ARN
+    Condition: CreateCertificate
+    Value: !Ref ApiCertificate
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateArn'
+

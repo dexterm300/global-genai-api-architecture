@@ -1,0 +1,49 @@
+# Example Routing Configuration
+# This file demonstrates how to configure routing for different applications
+# to specific Bedrock agents and knowledge bases.
+
+# List of available Bedrock agents
+agents:
+  - "AGENT_ID_1"
+  - "AGENT_ID_2"
+  - "AGENT_ID_3"
+
+# List of available knowledge bases
+knowledge_bases:
+  - "KB_ID_1"
+  - "KB_ID_2"
+  - "KB_ID_3"
+
+# Default agent to use if no specific routing rule matches
+default_agent: "AGENT_ID_1"
+
+# Routing rules per application
+# Each application can be routed to a specific agent and knowledge base
+routing_rules:
+  webapp1:
+    agent: "AGENT_ID_1"
+    knowledge_base: "KB_ID_1"
+    model_id: "anthropic.claude-v2"  # Optional: specific model override
+  
+  webapp2:
+    agent: "AGENT_ID_2"
+    knowledge_base: "KB_ID_2"
+    model_id: "anthropic.claude-v2"
+  
+  webapp3:
+    agent: "AGENT_ID_3"
+    knowledge_base: "KB_ID_3"
+    model_id: "amazon.titan-text-express-v1"
+  
+  default:
+    agent: "AGENT_ID_1"
+    knowledge_base: "KB_ID_1"
+
+# Advanced routing based on request attributes
+# You can extend this to route based on:
+# - Request path
+# - User attributes
+# - Request content type
+# - Time of day
+# - Geographic location
+

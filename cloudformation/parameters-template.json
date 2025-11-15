@@ -1,0 +1,59 @@
+[
+  {
+    "ParameterKey": "DomainName",
+    "ParameterValue": "api.example.com"
+  },
+  {
+    "ParameterKey": "PrimaryRegion",
+    "ParameterValue": "us-east-1"
+  },
+  {
+    "ParameterKey": "SecondaryRegions",
+    "ParameterValue": "us-west-2,eu-west-1"
+  },
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "prod"
+  },
+  {
+    "ParameterKey": "Applications",
+    "ParameterValue": "webapp1,webapp2,webapp3"
+  },
+  {
+    "ParameterKey": "BedrockAgents",
+    "ParameterValue": "agent-12345,agent-67890,agent-11111"
+  },
+  {
+    "ParameterKey": "KnowledgeBases",
+    "ParameterValue": "KB12345,KB67890,KB11111"
+  },
+  {
+    "ParameterKey": "CacheTTL",
+    "ParameterValue": "3600"
+  },
+  {
+    "ParameterKey": "EnableDAX",
+    "ParameterValue": "true"
+  },
+  {
+    "ParameterKey": "EnableCloudFront",
+    "ParameterValue": "true"
+  },
+  {
+    "ParameterKey": "DAXNodeType",
+    "ParameterValue": "dax.t3.small"
+  },
+  {
+    "ParameterKey": "DAXClusterSize",
+    "ParameterValue": "1"
+  },
+  {
+    "ParameterKey": "WAFAllowedIPs",
+    "ParameterValue": "203.0.113.0/24,198.51.100.0/24"
+  },
+  {
+    "ParameterKey": "CertificateArn",
+    "ParameterValue": ""
+  }
+]
+
