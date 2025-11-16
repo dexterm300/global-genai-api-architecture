@@ -573,6 +573,7 @@ This project is provided as-is for deployment purposes. Ensure compliance with A
 
 ---
 
-**Last Updated**: 2024
-**Maintained By**: Your Team Name
+**Last Updated**: 2025
+**Maintained By**: Dexter M.
+
 
